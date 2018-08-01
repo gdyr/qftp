@@ -1,0 +1,486 @@
+PluginInfo = {
+  Name = "FTP Server",
+  Version = "1.0",
+  Id = "2f430026-2bdf-43ab-b01b-85d37eab83cc",
+  Description = "FTP Server for Q-Sys",
+  ShowDebug = true
+}
+
+function GetControls()
+  return {
+    { Name = 'Passive IP',
+      ControlType = 'Text' },
+    { Name = 'Username',
+      ControlType = 'Text' },
+    { Name = 'Passive IP',
+      ControlType = 'Text' },
+    { Name = 'Save',
+      ControlType = 'Button' },
+    { Name = 'Cancel',
+      ControlType = 'Button' },
+    { Name = '_config',
+      ControlType = 'Text' },
+    { Name = 'Status',
+      ControlType = 'Indicator',
+      IndicatorType = 'Status' }
+  }
+end
+
+--[[function GetControlLayout()
+
+  return {
+    ['Passive IP'] = {
+
+    }
+  }
+
+end;]]
+
+--[[ Control Script Demarcation Point ]]--
+if(not Controls) then return;
+
+require('json');
+
+-- Status Display
+function updateStatus(val, str)
+  Controls['Status'].Value = val;
+  Controls['Status'].String = str;
+end;
+
+-- IP Address Selection
+IPTimer = Timer.New()
+IPTimer.EventHandler = function()
+  local ok;
+  local choices = {};
+  for _,interface in pairs(Network.Interfaces()) do
+    if(interface.Address == Controls['Passive IP'].String) then ok = true; end;
+    table.insert(choices, interface.Address);
+  end;
+  Controls['Passive IP'].Choices = choices;
+  if(not ok) then
+    Controls['Passive IP'].String = choices[1];
+  end;
+end
+IPTimer:Start(1);
+
+-- Config management
+function loadConfig()
+  local ok;
+  ok,CONFIG = pcall(json.decode, Controls['_config'].String);
+  if(not ok) then
+    CONFIG = {
+      Username = 'ftpuser',
+      Password = 'ftppass'
+    };
+    Controls['_config'].String = json.encode(CONFIG);
+  end;
+end
+loadConfig();
+
+function temp(c) c.Color = '#99BBFF'; end;
+Controls['Username'].EventHandler = temp;
+Controls['Password'].EventHandler = temp;
+
+function showConfig()
+  for k,v in pairs(CONFIG) do
+    Controls[k].String = v;
+    Controls[k].Color = 'white';
+  end;
+end; showConfig();
+
+Controls['Save'].EventHandler = function()
+  for k,v in pairs(CONFIG) do
+    CONFIG[k] = Controls[k].String;
+  end;
+  Controls['_config'].String = json.encode(CONFIG);
+  showConfig();
+end;
+
+Controls['Cancel'].EventHandler = showConfig;
+
+AUTH = {
+  USER = 'gmichael225',
+  PASS = 'test',
+  Check = function(u,p)
+    return u == AUTH.USER and p == AUTH.PASS;
+  end
+};
+
+IP = '10.0.0.171';
+
+-- [[ Main FTP Socket Server ]]
+FTP = TcpSocketServer.New();
+EOL = TcpSocket.EOL.CrLf;
+SESSIONS = {};
+FTP.EventHandler = function(sock)
+
+  -- New connection, say hello
+  SESSIONS[sock] = {
+    write = function(s)
+      if(not sock.IsConnected) then return; end;
+      sock:Write(s..'\r\n');
+      if(DEBUG) then print('> ' .. s); end;
+    end,
+    cwd = '/',
+    close = function()
+      sock:Disconnect();
+    end;
+  };
+  SESSIONS[sock].write('220 QLuaFTP [ WARNING - EXPERIMENTAL ]');
+
+  sock.Data = function()
+    local line = sock:ReadLine(EOL);
+    while(line ~= nil) do
+      if(DEBUG) then print('< ' .. line); end;
+      local cmd, params = line:match('(%u+) ?(.*)');
+      if((not SESSIONS[sock].authed) and cmd ~= 'USER' and cmd ~= 'PASS' and cmd ~= 'QUIT') then
+        SESSIONS[sock].write('530 Login with USER and PASS');
+      elseif(not cmd or not CMD[cmd]) then 
+        SESSIONS[sock].write('500 Unknown command');
+      else
+        CMD[cmd](SESSIONS[sock], params);
+      end;
+      line = sock:ReadLine(EOL);
+    end;
+  end;
+  
+  sock.EventHandler = function(sock, evt)
+    print('ftp', sock, evt)
+  end;
+  
+end
+FTP:Listen(21);
+
+-- [[ Ephemeral Socket Servers ]]
+ESS = {
+  Pool = {},
+  New = function(session)
+    local server;
+    for _,s in pairs(ESS.Pool) do -- reuse when possible
+      if(not s.session) then
+        server = s;
+      end;
+    end;
+    if(not server) then
+      server = {
+        _server = TcpSocketServer.New(),
+        Write = function(self, s)
+          self.channel:Write(s);
+        end,
+        WriteAndClose = function(self, s)
+          self.channel:Write(s);
+          Timer.CallAfter(function() self:Close(); end, 0.1);
+        end,
+        Retrieve = function(self, cb)
+          self.channel:Download(cb);
+        end,
+        Transfer = function(self, cb)
+          self.channel:Upload(cb);
+        end,
+        Target = function(self, target)
+          self.channel.target = target;
+        end,
+        Close = function(self)
+          self.session = nil;
+          self.channel:Close();
+        end; 
+      };
+      server._server.EventHandler = function(sock)
+        if(server.channel) then server.channel:Close(); end
+        server.channel = CHN.New(sock, 'passive');
+      end; 
+      while(not server.port) do
+        local random_port = math.random(32768, 61000);
+        local ok,err = pcall(server._server.Listen, server._server, random_port)
+        if(ok) then
+          server.port = {math.floor(random_port/256), random_port % 256};
+          print('ephemeral on ' .. random_port);
+        end;
+      end
+      table.insert(ESS.Pool, server);
+    end;
+    server.session = session;
+    return server;
+    
+  end
+};
+
+--[[ Data Transfer Channels ]]
+CHN = {
+  New = function(sock, mode)
+    
+    -- Create channel
+    local channel = {
+      Close = function(self)
+        if(self.target) then -- close file handle if open
+          self.target:close();
+          self.target = nil;
+        end;
+        if(sock.IsConnected) then -- close socket if open
+          sock:Disconnect();
+        end;
+      end,
+      Write = function(self, s)
+        sock:Write(s)
+      end,
+      Upload = function(self, cb)
+        if(not sock.IsConnected) then
+          sock:Connect(self._host, self._port);
+        end;
+        sock.Closed = cb;
+      end,
+      Download = function(self, cb)
+        self.TransferTimer = Timer.New(); i= 0;
+        self.TransferTimer.EventHandler = function()
+          local data = self.target and self.target:read(1024 ^ 2);
+          if(not sock.IsConnected) then
+            self.TransferTimer:Stop();
+            cb('Connection dropped!');
+          elseif(data) then
+            sock:Write(data);
+          else
+            self.TransferTimer:Stop();
+            Timer.CallAfter(cb, 1);
+          end;
+        end;
+        self.TransferTimer:Start(0.1);
+      end
+    };
+    
+    -- sock.WriteTimeout = 5;
+    sock.ReconnectTimeout = 0; -- never reconnect, this is the control channel's job.
+    
+    sock.Data = function() -- need to change this to a timer.
+      if(not channel.target) then print('no handle'); return; end;
+      while(sock.BufferLength > 0) do
+        channel.target:write(sock:Read(1024^2));
+      end;
+    end;
+    
+    sock.EventHandler = function(sock, evt)
+      print('passive', sock, evt);
+    end;
+    
+    return channel;
+    
+  end;
+}
+
+IP = {('10.0.0.171'):match('([0-2]?%d?%d)%.([0-2]?%d?%d)%.([0-2]?%d?%d)%.([0-2]?%d?%d)')};
+
+CMD = {};
+
+CMD['FEAT'] = function(s)
+  s.write('211-Features:');
+  s.write('EPSV');
+  s.write('PASV');
+  s.write('SIZE');
+  s.write('211 End');
+end;
+
+CMD['HELP'] = function(s)
+  s.write('214-The following commands are recognized.');
+  local cmds = '';
+  for k,v in pairs(CMD) do
+    local cmd = k:match('^(%u+)$');
+    if(cmd) then cmds = cmds .. ' ' .. cmd;
+  end;
+  s.write(cmds);
+  s.write('214-Help OK');
+end;
+
+CMD['USER'] = function(s, p)
+  s.username = p;
+  s.write('331 Please specify the password');
+end;
+
+CMD['PASS'] = function(s, p)
+  if(not s.username) then
+    s.write('503 Login with USER');
+  else
+    if(AUTH.Check(s.username, p)) then
+      s.authed = true;
+      s.write('230 Operation successful');
+    else
+      s.write('530 Invalid password');
+    end;
+  end;
+end;
+
+CMD['ACCT'] = function(s)
+  s.write('202 Account information not required');
+end;
+
+CMD['PASV'] = function(s)
+  s.mode = 'passive';
+  s.channel = ESS.New(s);
+  s.write(string.format('227 Entering Passive Mode. (%d,%d,%d,%d,%d,%d)', IP[1], IP[2], IP[3], IP[4], s.channel.port[1], s.channel.port[2]));
+end;
+
+CMD['EPSV'] = function(s)
+  s.mode = 'passive';
+  s.channel = ESS.New(s);
+  s.write('227 EPSV ok (|||' .. (s.channel.port[1]*256 + s.channel.port[2]) ..  '|)')
+end;
+
+--[[CMD['PORT'] = function(s,p)
+  local ip,port_hi,port_lo = p:match('(%d+,%d+,%d+,%d+),(%d+),(%d+)')
+  ip = ip:gsub(',','.');
+  local port = tonumber(port_hi) * 256 + tonumber(port_lo);
+  if(s.channel) then s.channel:Close(); end;
+  s.channel = {
+    _socket = TcpSocket.New(),
+    _ip = ip,
+    _port = port,
+    Close = function(self)
+      if(self._socket.IsConnected) then self._socket:Disconnect(); end;
+      self._socket = nil;
+    end,
+    Connect = function(self)
+      self._socket:Connect(self._ip, self._port);
+    end,
+    Write = function(self, s)
+      if(not self._socket.IsConnected) then self:Connect(); end;
+      self._socket:Write(s);
+    end
+  };
+  s.channel._socket.ReconnectTimeout = 0;
+  s.channel._socket.Data = function()
+    if(not s.channel.target) then print('no handle'); return; end;
+    while(s.channel._socket.BufferLength > 0) do
+      s.channel.target:write(s.channel._socket:Read(1024^2));
+    end;
+  end;
+  s.channel._socket.EventHandler = function(sock, evt)
+    print('active', sock, evt);
+    if(evt == TcpSocket.Events.Connected) then return; end;
+    if(s.channel.cb and evt == TcpSocket.Events.Closed) then s.channel.cb(); end;
+    if(s.channel.target) then
+      s.channel.target:close();
+      s.channel.target = nil;
+    end
+  end;
+  s.write('200 Operation successful');
+end;]]
+
+CMD.DirList = function(s, plain)
+  if(not s.channel) then s.write('425 Use PORT/PASV first'); return; end;
+  s.write('150 Directory listing');
+  s.channel:WriteAndClose(DIR.ls(s.cwd, plain));
+  s.channel = nil;
+  s.write('226 Operation successful'); 
+end;
+
+CMD['LIST'] = function(s)
+  CMD.DirList(s);
+end;
+
+CMD['NLST'] = function(s)
+  CMD.DirList(s, true);
+end
+
+CMD['PWD'] = function(s)
+  s.write('257 "' .. s.cwd .. '"');
+end;
+
+CMD['CWD'] = function(s, p)
+  local newPath = '';
+  if(p:match('^/')) then newPath = p;
+  else newPath = s.cwd .. p; end;
+  local realPath = DIR.path(newPath);
+  if(os.rename(realPath, realPath)) then
+    s.cwd = newPath;
+    s.write('250 Operation successful');
+  else
+    s.write('550 Error');
+  end;
+end;
+  
+CMD['CDUP'] = function(s)
+  s.cwd = s.cwd:match('(.+)/') or "/";
+  s.write('250 Operation successful');
+end;
+
+CMD['TYPE'] = function(s, p)
+  s.representation = p;
+  s.write('200 Operation successful');
+end;
+
+CMD['STAT'] = function(s, p)
+  s.write('213-File status:');
+  s.write(DIR.ls(p));
+  s.write('213 Operation successful');
+end;
+
+CMD['RETR'] = function(s, p)
+  if(not s.channel) then s.write('425 Use PORT/PASV first'); return; end;
+  local fh = io.open(DIR.path(p), 'rb');
+  if(not fh) then s.write('550 Error'); return; end;
+  s.write('150 Opening BINARY connection for ' .. p);
+  s.channel:Target(fh);
+  s.channel:Retrieve(function(err)
+    print('callback called...');
+    s.write(err and ('550 Error - ' .. err) or '226 Operation successful.');
+    s.channel:Close();
+    s.channel = nil;
+  end);
+end;
+
+CMD['QUIT'] = function(s)
+  s.write('221 Operation successful');
+  Timer.CallAfter(s.close, 0.1);
+end;
+
+CMD.InitTransfer = function(s,p,m)
+  if(not s.channel) then s.write('425 Use PORT/PASV first'); return; end;
+  local fh,err = io.open(DIR.path(p), m..'b');
+  if(not fh) then s.write('553 Error - ' .. err); return; end;
+  s.channel:Target(fh);
+  s.write('150 Ok to send data');
+  s.channel:Transfer(function()
+    print('callback called...')
+    s.write('226 Operation successful');
+    s.channel:Close();
+    s.channel = nil;
+  end);
+end;
+
+
+CMD['STOR'] = function(s, p)
+  CMD.InitTransfer(s,p,'w');
+end;
+
+CMD['APPE'] = function(s, p)
+  CMD.InitTransfer(s,p,'a');
+end;
+  
+
+CMD['DELE'] = function(s, p)
+  local ok = os.remove(DIR.path(p));
+  s.write(ok and
+    '250 Operation successful' or
+    '550 Error'
+  ); 
+end;
+
+require('json')
+DIR = {
+  path = function(path)
+    return 'media' .. path;
+  end,
+  ls = function(path, plain)
+    local listing,r = dir.get(DIR.path(path)),'';
+    for i=1,#listing do 
+      local f = listing[i];
+      local line =
+        ((not plain) and ((f.type == 'directory' and 'drwxr-xr-x    2' or '-rw-r--r--    1') .. ' 65533    65533' ..
+        string.rep(' ', f.size > 0 and (11 - (math.floor(math.log(f.size, 10)+1))) or 10) .. ' ' .. f.size .. ' ' ..
+        'Jan 01  2001' .. ' ') or '') ..
+        f.name .. '\r\n';
+        r = r .. line;
+    end;
+    return r;
+  end
+}
+
+DEBUG = true;
