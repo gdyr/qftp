@@ -307,6 +307,10 @@ CMD['PASS'] = function(s, p)
   end;
 end;
 
+CMD['NOOP'] = function(s)
+  s.write('200 Ok');
+end;
+
 CMD['ACCT'] = function(s)
   s.write('202 Account information not required');
 end;
