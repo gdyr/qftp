@@ -6,13 +6,17 @@ PluginInfo = {
   ShowDebug = true
 }
 
+function GetProperties()
+  return {};
+end;
+
 function GetControls()
   return {
     { Name = 'Passive IP',
       ControlType = 'Text' },
     { Name = 'Username',
       ControlType = 'Text' },
-    { Name = 'Passive IP',
+    { Name = 'Password',
       ControlType = 'Text' },
     { Name = 'Save',
       ControlType = 'Button' },
@@ -29,15 +33,15 @@ end
 --[[function GetControlLayout()
 
   return {
-    ['Passive IP'] = {
-
+    ['Password'] = {
+      Style = "ComboBox"
     }
-  }
+  }, {};
 
 end;]]
 
 --[[ Control Script Demarcation Point ]]--
-if(not Controls) then return;
+if(not Controls) then return; end;
 
 require('json');
 
@@ -62,6 +66,10 @@ IPTimer.EventHandler = function()
   end;
 end
 IPTimer:Start(1);
+Controls['Passive IP'].EventHandler = function(c)
+  IP = {c.String:match('([0-2]?%d?%d)%.([0-2]?%d?%d)%.([0-2]?%d?%d)%.([0-2]?%d?%d)')};
+  c.Color = (#ip==4) and 'white' or 'red';
+end;
 
 -- Config management
 function loadConfig()
@@ -99,14 +107,10 @@ end;
 Controls['Cancel'].EventHandler = showConfig;
 
 AUTH = {
-  USER = 'gmichael225',
-  PASS = 'test',
   Check = function(u,p)
-    return u == AUTH.USER and p == AUTH.PASS;
+    return u == CONFIG.Username and p == CONFIG.Password;
   end
 };
-
-IP = '10.0.0.171';
 
 -- [[ Main FTP Socket Server ]]
 FTP = TcpSocketServer.New();
@@ -266,8 +270,6 @@ CHN = {
   end;
 }
 
-IP = {('10.0.0.171'):match('([0-2]?%d?%d)%.([0-2]?%d?%d)%.([0-2]?%d?%d)%.([0-2]?%d?%d)')};
-
 CMD = {};
 
 CMD['FEAT'] = function(s)
@@ -283,7 +285,7 @@ CMD['HELP'] = function(s)
   local cmds = '';
   for k,v in pairs(CMD) do
     local cmd = k:match('^(%u+)$');
-    if(cmd) then cmds = cmds .. ' ' .. cmd;
+    if(cmd) then cmds = cmds .. ' ' .. cmd; end;
   end;
   s.write(cmds);
   s.write('214-Help OK');
@@ -449,7 +451,6 @@ CMD.InitTransfer = function(s,p,m)
   end);
 end;
 
-
 CMD['STOR'] = function(s, p)
   CMD.InitTransfer(s,p,'w');
 end;
@@ -457,7 +458,6 @@ end;
 CMD['APPE'] = function(s, p)
   CMD.InitTransfer(s,p,'a');
 end;
-  
 
 CMD['DELE'] = function(s, p)
   local ok = os.remove(DIR.path(p));
@@ -467,7 +467,6 @@ CMD['DELE'] = function(s, p)
   ); 
 end;
 
-require('json')
 DIR = {
   path = function(path)
     return 'media' .. path;
